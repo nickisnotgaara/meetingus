@@ -29,6 +29,13 @@ cpal = "0.15"
 wasapi = "0.27"
 webrtc-vad = "0.4"
 tracing = "0.1"
+whisper-rs = "0.16"
+
+[features]
+default = []
+# GPU decode (small: 53x RTFx on RTX 4060, see replica/ai-stack.md).
+# Build with `--features cuda` when CUDA toolkit (nvcc) is available.
+cuda = ["whisper-rs/cuda"]
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
