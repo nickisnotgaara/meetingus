@@ -12,6 +12,15 @@ pub enum Role {
     Them,
 }
 
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Me => "me",
+            Role::Them => "them",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AudioChunk {
     pub role: Role,
