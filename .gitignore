@@ -7,3 +7,6 @@ shared-state.json
 models/
 sessions/
 replica/spike/*.wav
+node_modules/
+dist/
+*.local
