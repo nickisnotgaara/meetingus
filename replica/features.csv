@@ -1,0 +1,60 @@
+feature,area,priority,original,clone,notes
+Start/stop listening session,session,must,yes,no,Widget Start/End plus session timer
+Capture microphone (me role),audio,must,yes,no,48 kHz with health monitoring
+Capture system audio loopback (them role),audio,must,yes,no,Separate stream; never joins the call as a bot
+Real-time transcription me/them,transcription,must,yes,no,Original claims 12+ languages and ~300 ms; ours is local ASR
+Widget nav bar (drag/logo/audio toggle/end timer/close),widget,must,yes,no,Nav bar from public docs
+Widget hide/show (Ctrl+\),widget,must,yes,no,
+Assist via Ctrl+Enter with streaming answer,assist,must,yes,no,Uses transcript plus screen context
+What should I say action,assist,must,yes,no,Default action button
+Follow-up questions action,assist,must,yes,no,
+Recap action,assist,must,yes,no,
+Screenshot/screen context for answers,context,must,yes,no,Always-on since v1.89 with Sent with screenshot preview
+Default keybinds set,settings,must,yes,no,Ctrl+Enter assist; Ctrl+\ hide; move +-80; Ctrl+R clear
+Meeting notes: summary + next steps + transcript,notes,must,yes,no,Generated when a session properly ends
+Copy summary / copy transcript,notes,must,yes,no,
+View transcript (waveform icon),notes,must,yes,no,
+Delete meeting item,notes,must,yes,no,
+Dashboard Activity list,dashboard,must,yes,no,Default home view
+Onboarding: permission prompts (mic/screen),onboarding,must,yes,no,
+Live transcript in dashboard (real-time),transcription,should,yes,no,Moved out of the widget in v1.90.1
+Smart mode toggle,assist,should,yes,no,Deep reasoning; ours maps to MiMo Pro
+Clear conversation (Ctrl+R),assist,should,yes,no,
+Screenshot capture toggle in settings,context,should,yes,no,Privacy control added in v1.78
+Custom instructions (persona),context,should,yes,no,
+File upload as context,context,should,yes,no,Original 3 files on free; ours unlimited local
+Modes (presets: instructions + email template),context,should,yes,no,
+Resume session,session,should,yes,no,Continue an ended session with accumulated context
+Auto-end session (calendar alert / mic change),session,should,yes,no,
+Editable summary (manual edit),notes,should,yes,no,
+Manual notes per session,notes,should,yes,no,Write your notes here
+Ask about this meeting (RAG),notes,should,yes,no,Questions over a saved session
+Chat history per meeting,notes,should,yes,no,Transcript tab UI from v1.81
+Draft follow-up email,notes,should,yes,no,
+Search meetings (fuzzy),notes,should,yes,no,Global search / command palette
+Upcoming meetings cards + Join,calendar,should,yes,no,Requires calendar connection
+Google Calendar integration,calendar,should,yes,no,Original supports only Google Calendar
+Meeting notification popups,notifications,should,yes,no,360 px top-right: Take notes / Get notes / Join
+Custom keybinds (recorder mode),settings,should,yes,no,Recording mode blocks other keybinds
+Language settings (output / meeting audio),settings,should,yes,no,
+Theme system/light/dark,settings,should,yes,no,
+Change display (monitor selection),settings,should,yes,no,
+Tray icon + menu,tray,should,yes,no,
+Move window hotkeys (+-80 px),widget,should,yes,no,
+Fact check action,assist,could,yes,no,From the older Live Insights action set
+Web search in Smart mode,assist,could,yes,no,Requires a search API
+Ambient mode (overlay without session),session,could,yes,no,isAmbientEnabled
+Session inactivity modal (10 min),session,could,yes,no,
+Scroll response hotkeys (+-240),widget,could,yes,no,
+Auto-launch at login,settings,could,yes,no,
+Audio input test (mic level + transcript preview),settings,could,yes,no,Audio Settings added in v1.90.1
+Auto-updater,updates,could,yes,no,Tauri updater considered later
+Report a bug button,meta,could,yes,no,
+Who am I talking to / participant briefs,calendar,could,no,skip,External profile research — ToS risk; not cloned
+Share notes public link,notes,could,no,skip,Requires hosting; replaced by local export
+Undetectability (hidden from screen share),stealth,must,yes,skip,Owner decision: excluded entirely
+Sign in / accounts / device limit,accounts,must,yes,skip,Local-first app: no accounts, no cloud sync
+Billing / subscriptions / plan limits,billing,must,yes,skip,Free unlimited open source; no quotas
+Mobile app (iOS),mobile,could,yes,skip,Out of Rust scope; Windows + Linux only
+macOS build,desktop,could,yes,skip,Owner decision: Windows + Linux only
+Enterprise (KB sync / CRM-ATS / SSO),enterprise,could,yes,skip,Out of MVP scope
