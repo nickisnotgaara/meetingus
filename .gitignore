@@ -6,3 +6,4 @@ target/
 shared-state.json
 models/
 sessions/
+replica/spike/*.wav
