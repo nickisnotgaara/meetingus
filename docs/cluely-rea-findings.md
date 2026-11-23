@@ -1,5 +1,7 @@
 # Cluely: результаты реверс-инжиниринга (REA)
 
+> **⚠️ SUPERSEDED (2026-11-24).** Этот документ описывает архитектуру **legacy egui-MVP** (`legacy/`), которая отложена в архив. Актуальные план и решения: `replica/plan.md` + отчёт eng-ревью. Поведенческие факты о Cluely ниже остаются справочными; рекомендации «что переносим в наш Rust-MVP» (egui-чат, stealth.rs/WDA_EXCLUDEFROMCAPTURE, GDI-скриншоты) **не действуют** — текущий стек: Tauri 2 + React, без stealth, Windows-first.
+
 Инструмент: `rea-agents` CLI, операция `analyze_javascript_application` по извлечённому `app.asar` (Cluely 2.0.200, `resources/app.asar`, ~27 МБ, 3299 файлов). Полный отчёт: `%TEMP%\opencode\rea-cluely.json` (303 МБ). Ниже — углублённый разбор `dist-electron/main.js` (552 КБ, 17 080 строк) и `dist/assets/transcription-*.js`.
 
 ## Окна (main.js, домены window/control/chat/dashboard/notification)
