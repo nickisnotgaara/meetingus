@@ -1,0 +1,8 @@
+target/
+.env
+*.log
+*.err
+*.cmd
+shared-state.json
+models/
+sessions/
