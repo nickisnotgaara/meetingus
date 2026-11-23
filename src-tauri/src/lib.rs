@@ -2,7 +2,9 @@
 pub mod asr;
 pub mod audio;
 pub mod db;
+pub mod dedup;
 pub mod llm;
+pub mod state;
 pub mod vad;
 
 #[tauri::command]
