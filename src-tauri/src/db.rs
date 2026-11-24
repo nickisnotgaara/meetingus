@@ -78,6 +78,45 @@ pub fn insert_segment(
     Ok(conn.last_insert_rowid())
 }
 
+/// Last `limit` transcript segments of a session, oldest first (context for Assist).
+pub fn recent_segments(
+    conn: &Connection,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT role, text FROM (
+            SELECT id, role, text FROM transcript_segments
+            WHERE session_id=?1 ORDER BY id DESC LIMIT ?2
+         ) ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![session_id, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+    Ok(rows)
+}
+
+/// Append a chat turn (user request or assistant answer) for history.
+pub fn insert_chat_message(
+    conn: &Connection,
+    session_id: Option<&str>,
+    role: &str,
+    content: &str,
+    thinking: Option<&str>,
+    smart: bool,
+    action: Option<&str>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO chat_messages
+           (session_id, role, content, thinking, smart_mode, action)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![session_id, role, content, thinking, smart as i64, action],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// Keyword search over chunked past meetings (FTS5, D15).
 /// Words are AND-ed as phrases; a word with no match yields no rows.
 pub fn search_chunks(conn: &Connection, query: &str) -> Result<Vec<(String, String)>> {
@@ -162,6 +201,40 @@ mod tests {
         assert_eq!(n, 2);
         // invalid role rejected by CHECK constraint
         assert!(insert_segment(&conn, &id, "bot", "x", 0, 1, None).is_err());
+    }
+
+    #[test]
+    fn recent_segments_returns_oldest_first_and_respects_limit() {
+        let conn = mem();
+        let id = create_session(&conn, "manual", None).unwrap();
+        for i in 0..5 {
+            insert_segment(&conn, &id, "them", &format!("line {i}"), i, i + 1, None).unwrap();
+        }
+        let rows = recent_segments(&conn, &id, 3).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].1, "line 2", "last 3, still chronological");
+        assert_eq!(rows[2].1, "line 4");
+    }
+
+    #[test]
+    fn chat_messages_persist_with_action_and_flags() {
+        let conn = mem();
+        let id = create_session(&conn, "manual", None).unwrap();
+        insert_chat_message(&conn, Some(&id), "user", "what should I say?", None, true, Some("custom"))
+            .unwrap();
+        insert_chat_message(&conn, Some(&id), "assistant", "Ask about timing.", Some("think"), true, Some("custom"))
+            .unwrap();
+        let (role, content, smart, action): (String, String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT role, content, smart_mode, action FROM chat_messages ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(role, "assistant");
+        assert_eq!(content, "Ask about timing.");
+        assert_eq!(smart, 1);
+        assert_eq!(action.as_deref(), Some("custom"));
     }
 
     #[test]

@@ -1,17 +1,49 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
 
 type Segment = {
-  role: string;
+  role: "me" | "them";
   text: string;
   start_ms: number;
   end_ms: number;
 };
 
+type Answer = {
+  id: string;
+  label: string;
+  text: string;
+  thinking: boolean;
+  streaming: boolean;
+  error?: string;
+  elapsedMs?: number;
+  model?: string;
+};
+
+const ACTIONS: ReadonlyArray<{ key: string; label: string; primary?: boolean }> = [
+  { key: "assist", label: "Assist", primary: true },
+  { key: "what_to_say", label: "What should I say?" },
+  { key: "followup", label: "Follow-up questions" },
+  { key: "recap", label: "Recap" },
+];
+
+const LABELS: Record<string, string> = {
+  assist: "Assist",
+  what_to_say: "What to say",
+  followup: "Follow-ups",
+  recap: "Recap",
+  custom: "You asked",
+};
+
 const mmss = (s: number) =>
   `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+
+const newId = () =>
+  typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 export default function App() {
   const [running, setRunning] = useState(false);
@@ -20,8 +52,34 @@ export default function App() {
   const [input, setInput] = useState("");
   const [smart, setSmart] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [answer, setAnswer] = useState<Answer | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [keyStatus, setKeyStatus] = useState<{ configured: boolean; source?: string } | null>(null);
+  const [keyInput, setKeyInput] = useState("");
+  const [keySaving, setKeySaving] = useState(false);
+
   const listRef = useRef<HTMLDivElement>(null);
+  const answerRef = useRef<HTMLDivElement>(null);
   const startedAt = useRef<number | null>(null);
+  const activeId = useRef<string | null>(null);
+  const askRef = useRef<(action: string, question?: string) => void>(() => {});
+  const segmentsRef = useRef<Segment[]>([]);
+  const runningRef = useRef(false);
+
+  segmentsRef.current = segments;
+  runningRef.current = running;
+
+  const refreshKeyStatus = useCallback(async () => {
+    try {
+      setKeyStatus(await invoke<{ configured: boolean; source?: string }>("api_key_status"));
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshKeyStatus();
+  }, [refreshKeyStatus]);
 
   useEffect(() => {
     const unlisteners: Array<() => void> = [];
@@ -40,16 +98,53 @@ export default function App() {
             setElapsed(0);
           }
         }),
-        listen<{ message: string }>("app://error", (e) =>
-          setError(e.payload.message),
-        ),
+        listen<{ message: string }>("app://error", (e) => setError(e.payload.message)),
         listen<{ role: string; stalled: boolean }>("audio://health", (e) =>
-          setError(
-            e.payload.stalled
-              ? `${e.payload.role} audio stalled for >10s`
-              : null,
-          ),
+          setError(e.payload.stalled ? `${e.payload.role} audio stalled for >10s` : null),
         ),
+        listen<{ request_id: string; text: string }>("assist://delta", (e) => {
+          if (e.payload.request_id !== activeId.current) return;
+          const delta = e.payload.text;
+          setAnswer((a) =>
+            a && a.id === e.payload.request_id
+              ? { ...a, text: a.text + delta, thinking: false, error: undefined }
+              : a,
+          );
+        }),
+        listen<{ request_id: string; chars: number }>("assist://thinking", (e) => {
+          if (e.payload.request_id !== activeId.current) return;
+          setAnswer((a) =>
+            a && a.id === e.payload.request_id ? { ...a, thinking: true } : a,
+          );
+        }),
+        listen<{ request_id: string; text: string; elapsed_ms: number; model: string }>(
+          "assist://done",
+          (e) => {
+            if (e.payload.request_id !== activeId.current) return;
+            setAnswer((a) =>
+              a && a.id === e.payload.request_id
+                ? {
+                    ...a,
+                    text: e.payload.text,
+                    thinking: false,
+                    streaming: false,
+                    elapsedMs: e.payload.elapsed_ms,
+                    model: e.payload.model,
+                  }
+                : a,
+            );
+          },
+        ),
+        listen<{ request_id: string; message: string }>("assist://error", (e) => {
+          if (e.payload.request_id !== activeId.current) return;
+          if (e.payload.message.includes("API key")) void refreshKeyStatus();
+          setAnswer((a) =>
+            a && a.id === e.payload.request_id
+              ? { ...a, thinking: false, streaming: false, error: e.payload.message }
+              : a,
+          );
+        }),
+        listen("assist://hotkey", () => askRef.current("assist")),
       ]);
       if (!cancelled) unlisteners.push(...subs);
       try {
@@ -70,11 +165,86 @@ export default function App() {
       unlisteners.forEach((u) => u());
       clearInterval(timer);
     };
-  }, []);
+  }, [refreshKeyStatus]);
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
   }, [segments]);
+
+  useEffect(() => {
+    answerRef.current?.scrollTo({ top: answerRef.current.scrollHeight });
+  }, [answer?.text, answer?.thinking]);
+
+  const ask = useCallback(
+    async (action: string, question?: string) => {
+      const trimmed = (question ?? "").trim();
+      if (action === "custom" && !trimmed) return;
+      if (
+        action !== "custom" &&
+        !runningRef.current &&
+        segmentsRef.current.length === 0
+      ) {
+        setError("Start a session first, or type a question below.");
+        return;
+      }
+      const id = newId();
+      activeId.current = id;
+      setCopied(false);
+      setError(null);
+      setAnswer({
+        id,
+        label: LABELS[action] ?? "Assist",
+        text: "",
+        thinking: true,
+        streaming: true,
+      });
+      try {
+        const res = await invoke<{ model: string }>("assist_ask", {
+          requestId: id,
+          action,
+          question: trimmed || null,
+          smart,
+        });
+        setAnswer((a) => (a && a.id === id ? { ...a, model: res.model } : a));
+      } catch (e) {
+        const message = String(e);
+        if (message.includes("API key")) void refreshKeyStatus();
+        if (message.includes("No conversation yet")) {
+          setError(message);
+          setAnswer(null);
+        } else {
+          setAnswer((a) =>
+            a && a.id === id ? { ...a, thinking: false, streaming: false, error: message } : a,
+          );
+        }
+      } finally {
+        if (action === "custom") setInput("");
+      }
+    },
+    [smart, refreshKeyStatus],
+  );
+
+  askRef.current = ask;
+
+  const stopAnswer = async () => {
+    try {
+      await invoke("assist_cancel");
+    } catch {
+      /* ignore */
+    }
+    setAnswer((a) => (a ? { ...a, streaming: false, thinking: false } : a));
+  };
+
+  const copyAnswer = async () => {
+    if (!answer?.text) return;
+    try {
+      await navigator.clipboard.writeText(answer.text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   const toggleSession = async () => {
     try {
@@ -82,6 +252,8 @@ export default function App() {
         await invoke("session_end");
       } else {
         setSegments([]);
+        setAnswer(null);
+        activeId.current = null;
         await invoke("session_start");
       }
       setError(null);
@@ -90,26 +262,70 @@ export default function App() {
     }
   };
 
+  const saveKey = async () => {
+    if (!keyInput.trim()) return;
+    setKeySaving(true);
+    try {
+      const status = await invoke<{ configured: boolean; source?: string }>("set_api_key", {
+        key: keyInput,
+      });
+      setKeyStatus(status);
+      setKeyInput("");
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setKeySaving(false);
+    }
+  };
+
+  const hideWindow = () => {
+    void getCurrentWindow().hide();
+  };
+
+  const hasContext = running || segments.length > 0;
+
   return (
     <div className="widget">
       <header className="w-header">
         <div className={`status ${running ? "on" : ""}`}>
           <span className="dot" />
-          <span className="label">
-            {running ? `Recording ${mmss(elapsed)}` : "Idle"}
-          </span>
+          <span className="label">{running ? `Recording ${mmss(elapsed)}` : "Idle"}</span>
         </div>
-        <button
-          className={`pill ${running ? "stop" : "start"}`}
-          onClick={toggleSession}
-        >
-          {running ? "End session" : "Start session"}
-        </button>
+        <div className="header-right">
+          <span className={`chip ${smart ? "gold" : ""}`} title="Model">
+            {smart ? "Smart · pro" : "Fast · flash"}
+          </span>
+          <button className="ghost" onClick={hideWindow} title="Hide (Ctrl+\)">
+            Hide
+          </button>
+          <button className={`pill ${running ? "stop" : "start"}`} onClick={toggleSession}>
+            {running ? "End session" : "Start session"}
+          </button>
+        </div>
       </header>
 
       {error && (
         <div className="banner" onClick={() => setError(null)}>
           {error}
+        </div>
+      )}
+
+      {keyStatus && !keyStatus.configured && (
+        <div className="keybar">
+          <span>MiMo key</span>
+          <input
+            type="password"
+            value={keyInput}
+            placeholder="paste API key"
+            onChange={(e) => setKeyInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void saveKey();
+            }}
+          />
+          <button onClick={saveKey} disabled={keySaving || !keyInput.trim()}>
+            {keySaving ? "…" : "Save"}
+          </button>
         </div>
       )}
 
@@ -129,39 +345,90 @@ export default function App() {
         ))}
       </div>
 
+      {answer && (
+        <div className={`answer ${answer.error ? "has-error" : ""}`}>
+          <div className="answer-head">
+            <span className="answer-label">{answer.label}</span>
+            {answer.model && (
+              <span className="answer-meta">
+                {answer.model.replace("mimo-v2.6-", "")}
+                {answer.elapsedMs ? ` · ${(answer.elapsedMs / 1000).toFixed(1)}s` : ""}
+              </span>
+            )}
+            <span className="answer-actions">
+              {answer.streaming && (
+                <button className="mini" onClick={stopAnswer} title="Stop">
+                  Stop
+                </button>
+              )}
+              {!answer.streaming && answer.text && (
+                <button className="mini" onClick={copyAnswer}>
+                  {copied ? "Copied" : "Copy"}
+                </button>
+              )}
+              <button
+                className="mini close"
+                onClick={() => setAnswer(null)}
+                title="Close"
+              >
+                ×
+              </button>
+            </span>
+          </div>
+          <div className="answer-body" ref={answerRef}>
+            {answer.thinking && !answer.text && !answer.error && (
+              <span className="thinking">
+                Thinking<span className="dots">…</span>
+              </span>
+            )}
+            {answer.text && <span className="answer-text">{answer.text}</span>}
+            {answer.streaming && answer.text && <span className="caret" />}
+            {answer.error && <span className="answer-error">{answer.error}</span>}
+          </div>
+        </div>
+      )}
+
       <div className="actions">
-        <button className="action primary" disabled title="wire in unit 8">
-          Assist
-        </button>
-        <button className="action" disabled title="wire in unit 8">
-          What should I say?
-        </button>
-        <button className="action" disabled title="wire in unit 8">
-          Follow-up questions
-        </button>
-        <button className="action" disabled title="wire in unit 8">
-          Recap
-        </button>
+        {ACTIONS.map((a) => (
+          <button
+            key={a.key}
+            className={`action ${a.primary ? "primary" : ""}`}
+            onClick={() => void ask(a.key)}
+            disabled={!hasContext || answer?.streaming}
+            title={!hasContext ? "Start a session first" : undefined}
+          >
+            {a.label}
+          </button>
+        ))}
       </div>
 
       <div className="inputrow">
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Ask a question, or about your screen…"
-          disabled
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && input.trim()) void ask("custom", input);
+          }}
+          placeholder="Ask anything, or about the meeting…"
         />
         <button
           className={`smart ${smart ? "on" : ""}`}
           onClick={() => setSmart(!smart)}
-          title="Smart mode"
+          title="Smart mode uses MiMo pro"
         >
           Smart
         </button>
-        <button className="send" disabled title="wire in unit 8">
+        <button
+          className="send"
+          onClick={() => void ask("custom", input)}
+          disabled={!input.trim() || answer?.streaming}
+          title="Send (Enter)"
+        >
           ↵
         </button>
       </div>
+
+      <footer className="hint">Ctrl+Enter Assist · Ctrl+\ Hide</footer>
     </div>
   );
 }

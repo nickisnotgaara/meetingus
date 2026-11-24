@@ -66,6 +66,9 @@ struct ChatRequest<'a> {
     model: &'a str,
     stream: bool,
     messages: Vec<ChatMessage<'a>>,
+    /// Fast mode turns MiMo reasoning off (probe: TTFT 3.5s -> 1.0s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +108,19 @@ impl MiMoClient {
         model: &str,
         system: &str,
         user: &str,
+        on_event: impl FnMut(StreamEvent),
+    ) -> Result<()> {
+        self.stream_chat_opts(model, system, user, false, on_event).await
+    }
+
+    /// `disable_thinking` maps to MiMo's chat_template_kwargs switch. Fast mode
+    /// (flash) uses it to cut TTFT; Smart mode leaves reasoning on.
+    pub async fn stream_chat_opts(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        disable_thinking: bool,
         mut on_event: impl FnMut(StreamEvent),
     ) -> Result<()> {
         let body = ChatRequest {
@@ -114,6 +130,8 @@ impl MiMoClient {
                 ChatMessage { role: "system", content: system },
                 ChatMessage { role: "user", content: user },
             ],
+            chat_template_kwargs: disable_thinking
+                .then(|| serde_json::json!({ "enable_thinking": false })),
         };
         let resp = self
             .http
@@ -176,6 +194,30 @@ mod tests {
     fn finish_reason_alone_is_not_done_until_sentinel() {
         let line = r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
         assert_eq!(parse_data_line(line), None, "[DONE] is the only terminator");
+    }
+
+    #[test]
+    fn fast_mode_serializes_thinking_off_smart_mode_omits_it() {
+        let fast = ChatRequest {
+            model: MODEL_FLASH,
+            stream: true,
+            messages: vec![],
+            chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": false })),
+        };
+        let value = serde_json::to_value(&fast).expect("serialize");
+        assert_eq!(value["chat_template_kwargs"]["enable_thinking"], false);
+
+        let smart = ChatRequest {
+            model: MODEL_PRO,
+            stream: true,
+            messages: vec![],
+            chat_template_kwargs: None,
+        };
+        let value = serde_json::to_value(&smart).expect("serialize");
+        assert!(
+            value.get("chat_template_kwargs").is_none(),
+            "smart mode keeps the provider default (reasoning on)"
+        );
     }
 
     /// Live smoke: needs MIMO_API_KEY in env. `cargo test -- --ignored`

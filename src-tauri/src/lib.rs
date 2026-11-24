@@ -1,8 +1,10 @@
 // meetingus — Cluely-clone core. Units: db, audio, vad, asr, llm, dedup,
-// state, session. This file wires them: app setup, session commands, the
-// capture->VAD->ASR->DB pipeline thread, health watchdog, UI events.
+// state, session, assist. This file wires them: app setup, session commands,
+// the capture->VAD->ASR->DB pipeline thread, Assist streaming, global
+// shortcuts, health watchdog, UI events.
 
 pub mod asr;
+pub mod assist;
 pub mod audio;
 pub mod db;
 pub mod dedup;
@@ -11,11 +13,16 @@ pub mod session;
 pub mod state;
 pub mod vad;
 
+use assist::Action;
 use state::AppState;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutEvent, ShortcutState};
+
+const KEYRING_SERVICE: &str = "meetingus";
+const KEYRING_ACCOUNT: &str = "mimo";
 
 fn model_path() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("STT_MODEL_PATH") {
@@ -41,6 +48,49 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn base_url() -> String {
+    std::env::var("MIMO_BASE_URL").unwrap_or_else(|_| llm::DEFAULT_BASE_URL.to_string())
+}
+
+/// MiMo key: env override (dev/CI) first, then the OS keyring (D6).
+fn api_key() -> Result<(String, &'static str), String> {
+    if let Ok(key) = std::env::var("MIMO_API_KEY") {
+        let key = key.trim().to_string();
+        if !key.is_empty() {
+            return Ok((key, "env"));
+        }
+    }
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        .map_err(|e| format!("keyring: {e}"))?;
+    match entry.get_password() {
+        Ok(key) if !key.trim().is_empty() => Ok((key.trim().to_string(), "keyring")),
+        _ => Err("MiMo API key is not set. Paste it in the app or set MIMO_API_KEY.".into()),
+    }
+}
+
+/// Load whisper once at startup (487 MB on CUDA) so session_start is instant.
+/// T12: model is preloaded; the pipeline waits for this slot.
+fn preload_transcriber(app: AppHandle) {
+    let _ = std::thread::Builder::new()
+        .name("whisper-preload".into())
+        .spawn(move || {
+            let state = app.state::<AppState>();
+            let path = model_path();
+            tracing::info!("loading whisper model at {}", path.display());
+            match asr::Transcriber::new(&path, "auto", stt_threads()) {
+                Ok(t) => {
+                    state.set_transcriber(Arc::new(t));
+                    tracing::info!("whisper model ready");
+                }
+                Err(err) => {
+                    let message = format!("STT model: {err:#}");
+                    state.set_transcriber_error(message.clone());
+                    let _ = app.emit("app://error", serde_json::json!({ "message": message }));
+                }
+            }
+        });
 }
 
 /// Capture -> VAD -> ASR -> dedup -> SQLite -> UI events. Runs until every
@@ -85,16 +135,24 @@ fn spawn_pipeline(app: AppHandle, session_id: String, running: Arc<std::sync::at
         .name("transcribe".into())
         .spawn(move || {
             let state = app.state::<AppState>();
-            let transcriber = match asr::Transcriber::new(&model_path(), "auto", stt_threads()) {
-                Ok(t) => t,
-                Err(err) => {
+            // preloaded at startup; wait for it instead of re-reading 487 MB
+            let transcriber = loop {
+                if let Some(t) = state.transcriber() {
+                    break Some(t);
+                }
+                if let Some(err) = state.transcriber_error() {
                     let _ = app.emit(
                         "app://error",
-                        serde_json::json!({ "message": format!("STT model: {err:#}") }),
+                        serde_json::json!({ "message": format!("STT model: {err}") }),
                     );
-                    return;
+                    break None;
                 }
+                if !running.load(Ordering::Relaxed) {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(150));
             };
+            let Some(transcriber) = transcriber else { return };
             let mut vad = vad::VadProcessor::new();
             let mut memory = session::TranscriptMemory::new(8);
             let started = Instant::now();
@@ -219,6 +277,217 @@ fn session_state(state: State<'_, AppState>) -> Result<serde_json::Value, String
     Ok(serde_json::json!({ "running": running, "session_id": session_id }))
 }
 
+#[derive(serde::Serialize)]
+struct ApiKeyStatus {
+    configured: bool,
+    source: Option<&'static str>,
+}
+
+#[tauri::command]
+fn api_key_status() -> ApiKeyStatus {
+    match api_key() {
+        Ok((_, source)) => ApiKeyStatus { configured: true, source: Some(source) },
+        Err(_) => ApiKeyStatus { configured: false, source: None },
+    }
+}
+
+#[tauri::command]
+fn set_api_key(key: String) -> Result<ApiKeyStatus, String> {
+    let key = key.trim();
+    if key.len() < 8 {
+        return Err("That key looks too short.".into());
+    }
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        .map_err(|e| format!("keyring: {e}"))?;
+    entry
+        .set_password(key)
+        .map_err(|e| format!("could not save the key: {e}"))?;
+    Ok(ApiKeyStatus { configured: true, source: Some("keyring") })
+}
+
+/// One Assist request. Streams deltas on `assist://delta`, reasoning on
+/// `assist://thinking`, and finishes with `assist://done` or `assist://error`.
+/// `request_id` is generated by the UI so no delta is lost before invoke returns.
+#[tauri::command]
+fn assist_ask(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request_id: String,
+    action: String,
+    question: Option<String>,
+    smart: bool,
+) -> Result<serde_json::Value, String> {
+    let request_id = request_id.trim().to_string();
+    if request_id.is_empty() || request_id.len() > 64 {
+        return Err("bad request id".into());
+    }
+    let action = Action::parse(&action).ok_or_else(|| "unknown action".to_string())?;
+    let question = question.unwrap_or_default();
+    if action == Action::Custom && question.trim().is_empty() {
+        return Err("Type a question first.".into());
+    }
+    let (key, _source) = api_key()?;
+
+    let session_id = state
+        .current_session
+        .lock()
+        .map_err(|_| "lock poisoned")?
+        .clone();
+    let (system, user) = {
+        let conn = state.db.lock().map_err(|_| "db lock poisoned")?;
+        let transcript = match &session_id {
+            Some(id) => db::recent_segments(&conn, id, 40).map_err(|e| e.to_string())?,
+            None => Vec::new(),
+        };
+        if transcript.is_empty() && action != Action::Custom {
+            return Err("No conversation yet — start a session or type a question.".into());
+        }
+        let request_label = if action == Action::Custom {
+            question.trim().to_string()
+        } else {
+            action.as_str().to_string()
+        };
+        db::insert_chat_message(
+            &conn,
+            session_id.as_deref(),
+            "user",
+            &request_label,
+            None,
+            smart,
+            Some(action.as_str()),
+        )
+        .map_err(|e| e.to_string())?;
+        (
+            assist::SYSTEM.to_string(),
+            assist::build_user_message(action, &question, &transcript),
+        )
+    };
+
+    // Cancel any previous stream and mark this generation.
+    let my_gen = state.assist_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let generation = state.assist_gen.clone();
+    let model = if smart { llm::MODEL_PRO } else { llm::MODEL_FLASH };
+    let base = base_url();
+    let rid = request_id.clone();
+    let app_task = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let client = llm::MiMoClient::new(base, key);
+        let mut text = String::new();
+        let mut thinking = String::new();
+        let started = Instant::now();
+
+        let generation_emit = generation.clone();
+        let app_emit = app_task.clone();
+        let rid_emit = rid.clone();
+        let result = client
+            .stream_chat_opts(model, &system, &user, !smart, |ev| {
+                if generation_emit.load(Ordering::SeqCst) != my_gen {
+                    return;
+                }
+                match ev {
+                    llm::StreamEvent::Text(t) => {
+                        text.push_str(&t);
+                        let _ = app_emit.emit(
+                            "assist://delta",
+                            serde_json::json!({ "request_id": rid_emit, "text": t }),
+                        );
+                    }
+                    llm::StreamEvent::Thinking(t) => {
+                        thinking.push_str(&t);
+                        let _ = app_emit.emit(
+                            "assist://thinking",
+                            serde_json::json!({ "request_id": rid_emit, "chars": thinking.chars().count() }),
+                        );
+                    }
+                    llm::StreamEvent::Done => {}
+                }
+            })
+            .await;
+
+        if generation.load(Ordering::SeqCst) != my_gen {
+            return; // superseded or cancelled: drop silently
+        }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match result {
+            Ok(()) if !text.trim().is_empty() => {
+                let st = app_task.state::<AppState>();
+                if let Ok(conn) = st.db.lock() {
+                    let _ = db::insert_chat_message(
+                        &conn,
+                        session_id.as_deref(),
+                        "assistant",
+                        text.trim(),
+                        if thinking.is_empty() { None } else { Some(thinking.as_str()) },
+                        smart,
+                        Some(action.as_str()),
+                    );
+                }
+                let _ = app_task.emit(
+                    "assist://done",
+                    serde_json::json!({
+                        "request_id": rid,
+                        "text": text,
+                        "elapsed_ms": elapsed_ms,
+                        "model": model,
+                    }),
+                );
+            }
+            Ok(()) => {
+                let _ = app_task.emit(
+                    "assist://error",
+                    serde_json::json!({
+                        "request_id": rid,
+                        "message": "The model returned an empty answer. Try again.",
+                    }),
+                );
+            }
+            Err(err) => {
+                let _ = app_task.emit(
+                    "assist://error",
+                    serde_json::json!({
+                        "request_id": rid,
+                        "message": format!("{err:#}"),
+                    }),
+                );
+            }
+        }
+    });
+
+    Ok(serde_json::json!({ "request_id": request_id, "model": model }))
+}
+
+#[tauri::command]
+fn assist_cancel(state: State<'_, AppState>) {
+    state.assist_gen.fetch_add(1, Ordering::SeqCst);
+}
+
+fn on_shortcut(app: &AppHandle, shortcut: &Shortcut, event: ShortcutEvent) {
+    if event.state() != ShortcutState::Pressed {
+        return;
+    }
+    let assist = Shortcut::new(Some(Modifiers::CONTROL), Code::Enter);
+    if shortcut == &assist {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        let _ = app.emit("assist://hotkey", serde_json::json!({}));
+        return;
+    }
+    let toggle = Shortcut::new(Some(Modifiers::CONTROL), Code::Backslash);
+    if shortcut == &toggle {
+        if let Some(window) = app.get_webview_window("main") {
+            if window.is_visible().unwrap_or(true) {
+                let _ = window.hide();
+            } else {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+    }
+}
+
 /// Legacy watchdog contract: warn when a role is silent >10s during a session.
 fn spawn_watchdog(app: AppHandle) {
     let _ = std::thread::Builder::new()
@@ -248,12 +517,30 @@ pub fn run() {
         .init();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(on_shortcut)
+                .build(),
+        )
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let state = AppState::open_at(&data_dir.join("meetingus.db"))?;
             app.manage(state);
+            preload_transcriber(app.handle().clone());
             spawn_watchdog(app.handle().clone());
+
+            // Global: Ctrl+Enter = Assist, Ctrl+\ = hide/show the widget.
+            let gs = app.global_shortcut();
+            for shortcut in [
+                Shortcut::new(Some(Modifiers::CONTROL), Code::Enter),
+                Shortcut::new(Some(Modifiers::CONTROL), Code::Backslash),
+            ] {
+                if let Err(err) = gs.register(shortcut) {
+                    tracing::warn!("global shortcut not registered: {err}");
+                }
+            }
+
             // dev/test seam: start a session without a UI click (E2E checks)
             if std::env::var("MEETINGUS_AUTOSTART").as_deref() == Ok("1") {
                 let h = app.handle().clone();
@@ -273,7 +560,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             session_start,
             session_end,
-            session_state
+            session_state,
+            assist_ask,
+            assist_cancel,
+            api_key_status,
+            set_api_key
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,8 +1,9 @@
 //! Shared application state: the single DB writer (ub-mode: one writer),
-//! the current session id, and audio health timestamps for the watchdog.
-//! Reads go through the same mutex — transactions are single-row and short;
-//! WAL still lets us add a read connection later without schema changes.
+//! the current session id, audio health timestamps for the watchdog, the
+//! preloaded whisper model (T12) and the Assist generation counter (cancels
+//! stale streams without aborting the HTTP request).
 
+use crate::asr::Transcriber;
 use crate::audio::Role;
 use crate::db;
 use anyhow::Result;
@@ -16,6 +17,11 @@ pub struct AppState {
     pub health: Health,
     /// Shared with capture/pipeline threads: cleared by session_end.
     pub audio_running: Arc<AtomicBool>,
+    /// Bumped by every assist_ask; older streams stop emitting.
+    pub assist_gen: Arc<AtomicU64>,
+    /// Loaded once at startup so session_start is instant (487 MB model).
+    pub transcriber: Mutex<Option<Arc<Transcriber>>>,
+    pub transcriber_error: Mutex<Option<String>>,
 }
 
 /// Last-seen timestamps (epoch seconds) per audio role; powers the 10s/30s
@@ -61,12 +67,31 @@ impl AppState {
             current_session: Mutex::new(None),
             health: Health::new(),
             audio_running: Arc::new(AtomicBool::new(false)),
+            assist_gen: Arc::new(AtomicU64::new(0)),
+            transcriber: Mutex::new(None),
+            transcriber_error: Mutex::new(None),
         })
     }
 
     /// Open the on-disk database (app data dir) and bootstrap state.
     pub fn open_at(path: &std::path::Path) -> Result<Self> {
         Self::new(db::open(path)?)
+    }
+
+    pub fn transcriber(&self) -> Option<Arc<Transcriber>> {
+        self.transcriber.lock().expect("transcriber lock").clone()
+    }
+
+    pub fn set_transcriber(&self, t: Arc<Transcriber>) {
+        *self.transcriber.lock().expect("transcriber lock") = Some(t);
+    }
+
+    pub fn set_transcriber_error(&self, message: String) {
+        *self.transcriber_error.lock().expect("transcriber lock") = Some(message);
+    }
+
+    pub fn transcriber_error(&self) -> Option<String> {
+        self.transcriber_error.lock().expect("transcriber lock").clone()
     }
 }
 
@@ -108,5 +133,14 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
             .expect("schema applied");
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn transcriber_slot_starts_empty_and_reports_errors() {
+        let state = AppState::open_at(std::path::Path::new(":memory:")).unwrap();
+        assert!(state.transcriber().is_none());
+        assert!(state.transcriber_error().is_none());
+        state.set_transcriber_error("boom".into());
+        assert_eq!(state.transcriber_error().as_deref(), Some("boom"));
     }
 }
