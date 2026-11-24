@@ -54,6 +54,7 @@ export default function App() {
   const [elapsed, setElapsed] = useState(0);
   const [answer, setAnswer] = useState<Answer | null>(null);
   const [copied, setCopied] = useState(false);
+  const [stalled, setStalled] = useState<string[]>([]);
   const [keyStatus, setKeyStatus] = useState<{ configured: boolean; source?: string } | null>(null);
   const [keyInput, setKeyInput] = useState("");
   const [keySaving, setKeySaving] = useState(false);
@@ -86,9 +87,10 @@ export default function App() {
     let cancelled = false;
     (async () => {
       const subs = await Promise.all([
-        listen<Segment>("transcript://segment", (e) =>
-          setSegments((s) => [...s, e.payload]),
-        ),
+        listen<Segment>("transcript://segment", (e) => {
+          setSegments((s) => [...s, e.payload]);
+          setStalled([]);
+        }),
         listen<{ running: boolean }>("session://state", (e) => {
           setRunning(e.payload.running);
           if (e.payload.running) {
@@ -99,9 +101,12 @@ export default function App() {
           }
         }),
         listen<{ message: string }>("app://error", (e) => setError(e.payload.message)),
-        listen<{ role: string; stalled: boolean }>("audio://health", (e) =>
-          setError(e.payload.stalled ? `${e.payload.role} audio stalled for >10s` : null),
-        ),
+        listen<{ role: string; stalled: boolean }>("audio://health", (e) => {
+          setStalled((roles) => {
+            const next = roles.filter((r) => r !== e.payload.role);
+            return e.payload.stalled ? [...next, e.payload.role] : next;
+          });
+        }),
         listen<{ request_id: string; text: string }>("assist://delta", (e) => {
           if (e.payload.request_id !== activeId.current) return;
           const delta = e.payload.text;
@@ -146,7 +151,12 @@ export default function App() {
         }),
         listen("assist://hotkey", () => askRef.current("assist")),
       ]);
-      if (!cancelled) unlisteners.push(...subs);
+      if (!cancelled) {
+        unlisteners.push(...subs);
+      } else {
+        // StrictMode unmounted before subscribe resolved: drop them now.
+        subs.forEach((u) => u());
+      }
       try {
         const s = await invoke<{ running: boolean }>("session_state");
         setRunning(s.running);
@@ -296,6 +306,11 @@ export default function App() {
           <span className={`chip ${smart ? "gold" : ""}`} title="Model">
             {smart ? "Smart · pro" : "Fast · flash"}
           </span>
+          {stalled.length > 0 && (
+            <span className="chip warn" title="No audio on this input for 10s">
+              {stalled.join("/")} silent
+            </span>
+          )}
           <button className="ghost" onClick={hideWindow} title="Hide (Ctrl+\)">
             Hide
           </button>
@@ -394,7 +409,7 @@ export default function App() {
             key={a.key}
             className={`action ${a.primary ? "primary" : ""}`}
             onClick={() => void ask(a.key)}
-            disabled={!hasContext || answer?.streaming}
+            disabled={!hasContext}
             title={!hasContext ? "Start a session first" : undefined}
           >
             {a.label}
@@ -421,7 +436,7 @@ export default function App() {
         <button
           className="send"
           onClick={() => void ask("custom", input)}
-          disabled={!input.trim() || answer?.streaming}
+          disabled={!input.trim()}
           title="Send (Enter)"
         >
           ↵

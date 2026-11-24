@@ -328,6 +328,11 @@ body {
   border-color: rgba(200, 184, 80, 0.45);
 }
 
+.chip.warn {
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, 0.45);
+}
+
 .ghost {
   border: none;
   background: transparent;

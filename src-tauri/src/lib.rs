@@ -333,9 +333,15 @@ fn assist_ask(
         .lock()
         .map_err(|_| "lock poisoned")?
         .clone();
-    let (system, user) = {
+    let (system, user, active_session) = {
         let conn = state.db.lock().map_err(|_| "db lock poisoned")?;
-        let transcript = match &session_id {
+        // After End session the id is cleared but the transcript stays on
+        // screen; Assist keeps working against the last conversation.
+        let active_session = match session_id {
+            Some(id) => Some(id),
+            None => db::latest_session_id(&conn).map_err(|e| e.to_string())?,
+        };
+        let transcript = match &active_session {
             Some(id) => db::recent_segments(&conn, id, 40).map_err(|e| e.to_string())?,
             None => Vec::new(),
         };
@@ -349,7 +355,7 @@ fn assist_ask(
         };
         db::insert_chat_message(
             &conn,
-            session_id.as_deref(),
+            active_session.as_deref(),
             "user",
             &request_label,
             None,
@@ -360,6 +366,7 @@ fn assist_ask(
         (
             assist::SYSTEM.to_string(),
             assist::build_user_message(action, &question, &transcript),
+            active_session,
         )
     };
 
@@ -415,7 +422,7 @@ fn assist_ask(
                 if let Ok(conn) = st.db.lock() {
                     let _ = db::insert_chat_message(
                         &conn,
-                        session_id.as_deref(),
+                        active_session.as_deref(),
                         "assistant",
                         text.trim(),
                         if thinking.is_empty() { None } else { Some(thinking.as_str()) },

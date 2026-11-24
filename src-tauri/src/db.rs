@@ -78,6 +78,17 @@ pub fn insert_segment(
     Ok(conn.last_insert_rowid())
 }
 
+/// Most recently started session id (ended sessions still give Assist context).
+pub fn latest_session_id(conn: &Connection) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM sessions ORDER BY started_at DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// Last `limit` transcript segments of a session, oldest first (context for Assist).
 pub fn recent_segments(
     conn: &Connection,
@@ -201,6 +212,15 @@ mod tests {
         assert_eq!(n, 2);
         // invalid role rejected by CHECK constraint
         assert!(insert_segment(&conn, &id, "bot", "x", 0, 1, None).is_err());
+    }
+
+    #[test]
+    fn latest_session_id_survives_session_end() {
+        let conn = mem();
+        let id = create_session(&conn, "manual", None).unwrap();
+        end_session(&conn, &id).unwrap();
+        assert_eq!(latest_session_id(&conn).unwrap().as_deref(), Some(id.as_str()));
+        assert_eq!(latest_session_id(&mem()).unwrap(), None);
     }
 
     #[test]
