@@ -177,6 +177,7 @@ fn start_session_core(app: &AppHandle, state: &AppState) -> Result<String, Strin
     state.audio_running.store(true, Ordering::Relaxed);
     spawn_pipeline(app.clone(), id.clone(), state.audio_running.clone());
     *state.current_session.lock().map_err(|_| "lock poisoned")? = Some(id.clone());
+    tracing::info!("session_start id={id}");
     let _ = app.emit(
         "session://state",
         serde_json::json!({ "running": true, "session_id": id }),
@@ -199,6 +200,7 @@ fn session_end(app: AppHandle, state: State<'_, AppState>) -> Result<(), String>
         }
     };
     *state.current_session.lock().map_err(|_| "lock poisoned")? = None;
+    tracing::info!("session_end id={ended:?}");
     let _ = app.emit(
         "session://state",
         serde_json::json!({ "running": false, "session_id": ended }),
