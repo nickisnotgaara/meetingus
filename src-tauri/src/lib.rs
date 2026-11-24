@@ -21,8 +21,8 @@ fn model_path() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("STT_MODEL_PATH") {
         return p.into();
     }
-    // dev builds run with cwd=src-tauri; resolve the repo models/ dir.
-    let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/ggml-small.bin");
+    // dev builds compile with cwd=src-tauri; resolve the repo models/ dir.
+    let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../models/ggml-small.bin");
     if dev.exists() {
         return dev;
     }
@@ -157,6 +157,11 @@ fn session_start(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    start_session_core(&app, &state)
+}
+
+/// Shared by the IPC command and the MEETINGUS_AUTOSTART dev/test flag.
+fn start_session_core(app: &AppHandle, state: &AppState) -> Result<String, String> {
     if state.audio_running.load(Ordering::Relaxed) {
         if let Some(id) = state.current_session.lock().expect("lock").clone() {
             return Ok(id); // idempotent
@@ -247,6 +252,20 @@ pub fn run() {
             let state = AppState::open_at(&data_dir.join("meetingus.db"))?;
             app.manage(state);
             spawn_watchdog(app.handle().clone());
+            // dev/test seam: start a session without a UI click (E2E checks)
+            if std::env::var("MEETINGUS_AUTOSTART").as_deref() == Ok("1") {
+                let h = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    let st = h.state::<AppState>();
+                    if let Err(e) = start_session_core(&h, &st) {
+                        let _ = h.emit(
+                            "app://error",
+                            serde_json::json!({ "message": format!("autostart: {e}") }),
+                        );
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
