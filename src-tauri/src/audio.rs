@@ -4,7 +4,9 @@
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -136,18 +138,24 @@ pub fn start_mic(tx: Sender<AudioChunk>) -> anyhow::Result<cpal::Stream> {
     Ok(stream)
 }
 
-pub fn start_system_loopback(tx: Sender<AudioChunk>) -> anyhow::Result<()> {
+pub fn start_system_loopback(
+    tx: Sender<AudioChunk>,
+    running: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("system-audio".to_string())
         .spawn(move || {
-            if let Err(err) = loopback_thread(tx) {
+            if let Err(err) = loopback_thread(tx, running) {
                 tracing::error!("system audio capture failed: {err:#}");
             }
         })?;
     Ok(())
 }
 
-fn loopback_thread(tx: Sender<AudioChunk>) -> anyhow::Result<()> {
+fn loopback_thread(
+    tx: Sender<AudioChunk>,
+    running: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     use wasapi::{
         initialize_mta, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat,
     };
@@ -169,9 +177,8 @@ fn loopback_thread(tx: Sender<AudioChunk>) -> anyhow::Result<()> {
 
     client.start_stream()?;
     tracing::info!("system loopback capture started at 16 kHz mono");
-    loop {
-        capture.read_from_device_to_deque(&mut queue)?;
-        while queue.len() >= 4 {
+    while running.load(std::sync::atomic::Ordering::Relaxed) {
+        capture.read_from_device_to_deque(&mut queue)?;        while queue.len() >= 4 {
             let bytes = [
                 queue.pop_front().unwrap(),
                 queue.pop_front().unwrap(),

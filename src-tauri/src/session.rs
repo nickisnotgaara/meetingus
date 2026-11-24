@@ -33,13 +33,6 @@ impl TranscriptMemory {
         }
     }
 
-    fn slot(&self, role: Role) -> &VecDeque<String> {
-        match role {
-            Role::Me => &self.me,
-            Role::Them => &self.them,
-        }
-    }
-
     pub fn push(&mut self, role: Role, text: impl Into<String>) {
         let cap = self.cap;
         let slot = self.slot_mut(role);

@@ -7,13 +7,15 @@ use crate::audio::Role;
 use crate::db;
 use anyhow::Result;
 use rusqlite::Connection;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub struct AppState {
     pub db: Mutex<Connection>,
     pub current_session: Mutex<Option<String>>,
     pub health: Health,
+    /// Shared with capture/pipeline threads: cleared by session_end.
+    pub audio_running: Arc<AtomicBool>,
 }
 
 /// Last-seen timestamps (epoch seconds) per audio role; powers the 10s/30s
@@ -58,6 +60,7 @@ impl AppState {
             db: Mutex::new(conn),
             current_session: Mutex::new(None),
             health: Health::new(),
+            audio_running: Arc::new(AtomicBool::new(false)),
         })
     }
 
