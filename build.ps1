@@ -14,9 +14,10 @@ if (Test-Path $vs) {
 }
 $python = Join-Path $env:LOCALAPPDATA "Programs\Python\Python314"
 $env:LIBCLANG_PATH = Join-Path $python "Lib\site-packages\clang\native"
-$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-
 $cuda = "C:\cuda-env\Library"
+# Python Scripts (ninja) + CUDA bin (nvcc) must precede MSVC for CUDA builds.
+$env:PATH = "$python\Scripts;$cuda\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
+
 if (Test-Path "$cuda\bin\nvcc.exe") {
     $env:CUDA_PATH = $cuda
     $env:CUDAToolkit_ROOT = $cuda
@@ -24,6 +25,8 @@ if (Test-Path "$cuda\bin\nvcc.exe") {
     $env:CMAKE_CUDA_COMPILER = "$cuda\bin\nvcc.exe"
     $env:CMAKE_CUDA_ARCHITECTURES = "89"
     $env:CMAKE_CUDA_FLAGS = "-allow-unsupported-compiler"
+    # The VS generator cannot attach CUDA without its integration; Ninja + CUDACXX works.
+    $env:CMAKE_GENERATOR = "Ninja"
 }
 
 $cmd = if ($args.Count -gt 0 -and $args[0] -ne "cuda") { $args[0] } else { "test" }
