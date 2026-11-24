@@ -22,6 +22,10 @@ pub struct AppState {
     /// Loaded once at startup so session_start is instant (487 MB model).
     pub transcriber: Mutex<Option<Arc<Transcriber>>>,
     pub transcriber_error: Mutex<Option<String>>,
+    /// Bumped to stop the onboarding mic-level monitor.
+    pub mic_gen: Arc<AtomicU64>,
+    /// Set by model_download_cancel; checked by the streaming downloader.
+    pub model_cancel: Arc<AtomicBool>,
 }
 
 /// Last-seen timestamps (epoch seconds) per audio role; powers the 10s/30s
@@ -70,6 +74,8 @@ impl AppState {
             assist_gen: Arc::new(AtomicU64::new(0)),
             transcriber: Mutex::new(None),
             transcriber_error: Mutex::new(None),
+            mic_gen: Arc::new(AtomicU64::new(0)),
+            model_cancel: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -84,6 +90,7 @@ impl AppState {
 
     pub fn set_transcriber(&self, t: Arc<Transcriber>) {
         *self.transcriber.lock().expect("transcriber lock") = Some(t);
+        *self.transcriber_error.lock().expect("transcriber lock") = None;
     }
 
     pub fn set_transcriber_error(&self, message: String) {
