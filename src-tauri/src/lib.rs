@@ -9,6 +9,7 @@ pub mod audio;
 pub mod db;
 pub mod dedup;
 pub mod llm;
+pub mod models;
 pub mod session;
 pub mod state;
 pub mod vad;
@@ -24,16 +25,39 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 const KEYRING_SERVICE: &str = "meetingus";
 const KEYRING_ACCOUNT: &str = "mimo";
 
-fn model_path() -> std::path::PathBuf {
+fn model_path(app: &AppHandle, state: &AppState) -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("STT_MODEL_PATH") {
-        return p.into();
+        return Some(p.into());
     }
-    // dev builds compile with cwd=src-tauri; resolve the repo models/ dir.
+    let root = models_root(app)?;
+    if let Some(id) = selected_model(state) {
+        if let Some(p) = models::model_file(&root, &id) {
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    // dev builds compile with cwd=src-tauri; reuse the repo models/ dir so a
+    // checkout works before onboarding has downloaded anything.
     let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../models/ggml-small.bin");
     if dev.exists() {
-        return dev;
+        return Some(dev);
     }
-    std::path::PathBuf::from("models/ggml-small.bin")
+    let small = models::model_file(&root, "small")?;
+    small.is_file().then_some(small)
+}
+
+/// Where model files live: an explicit override (dev/tests), else app data.
+fn models_root(app: &AppHandle) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("MEETINGUS_MODELS_DIR") {
+        return Some(p.into());
+    }
+    app.path().app_data_dir().ok()
+}
+
+fn selected_model(state: &AppState) -> Option<String> {
+    let conn = state.db.lock().ok()?;
+    db::get_setting(&conn, "stt_model").ok().flatten()
 }
 
 fn stt_threads() -> i32 {
@@ -77,7 +101,13 @@ fn preload_transcriber(app: AppHandle) {
         .name("whisper-preload".into())
         .spawn(move || {
             let state = app.state::<AppState>();
-            let path = model_path();
+            let Some(path) = model_path(&app, &state) else {
+                tracing::info!("no STT model yet — onboarding will download one");
+                state.set_transcriber_error(
+                    "No speech model yet — finish setup to download one.".into(),
+                );
+                return;
+            };
             tracing::info!("loading whisper model at {}", path.display());
             match asr::Transcriber::new(&path, "auto", stt_threads()) {
                 Ok(t) => {
@@ -223,6 +253,13 @@ fn start_session_core(app: &AppHandle, state: &AppState) -> Result<String, Strin
     if state.audio_running.load(Ordering::Relaxed) {
         if let Some(id) = state.current_session.lock().expect("lock").clone() {
             return Ok(id); // idempotent
+        }
+    }
+    // No model at all: fail fast instead of waiting forever in the pipeline.
+    // Still loading (no error yet) is fine — the pipeline waits for the slot.
+    if state.transcriber().is_none() {
+        if let Some(err) = state.transcriber_error() {
+            return Err(err);
         }
     }
     let id = {
@@ -469,6 +506,175 @@ fn assist_cancel(state: State<'_, AppState>) {
     state.assist_gen.fetch_add(1, Ordering::SeqCst);
 }
 
+// ---------------------------------------------------------------- onboarding
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OnboardingStatus {
+    needed: bool,
+    model_ready: bool,
+    model_error: Option<String>,
+    key_configured: bool,
+}
+
+#[tauri::command]
+fn onboarding_status(state: State<'_, AppState>) -> OnboardingStatus {
+    let onboarded = {
+        let conn = state.db.lock().expect("db lock");
+        db::get_setting(&conn, "onboarded").ok().flatten()
+    };
+    OnboardingStatus {
+        needed: onboarded.as_deref() != Some("1"),
+        model_ready: state.transcriber().is_some(),
+        model_error: state.transcriber_error(),
+        key_configured: api_key().is_ok(),
+    }
+}
+
+#[tauri::command]
+fn onboarding_complete(state: State<'_, AppState>) -> Result<(), String> {
+    if api_key().is_err() {
+        return Err("Add your MiMo API key before finishing setup.".into());
+    }
+    if state.transcriber().is_none() {
+        return Err(state
+            .transcriber_error()
+            .unwrap_or_else(|| "The speech model is still loading — retry shortly.".into()));
+    }
+    let conn = state.db.lock().map_err(|_| "db lock poisoned")?;
+    db::set_setting(&conn, "onboarded", "1").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn model_catalog(app: AppHandle, state: State<'_, AppState>) -> Result<models::Catalog, String> {
+    let root = models_root(&app).ok_or("no app data dir")?;
+    Ok(models::catalog(&root, selected_model(&state)))
+}
+
+#[tauri::command]
+async fn model_download(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<u64, String> {
+    let root = models_root(&app).ok_or("no app data dir")?;
+    let dest = models::model_file(&root, &id).ok_or_else(|| format!("unknown model: {id}"))?;
+    if dest.is_file() {
+        return Ok(dest.metadata().map(|m| m.len()).unwrap_or(0));
+    }
+    state.model_cancel.store(false, Ordering::SeqCst);
+    models::download(&app, &id, &dest, &state.model_cancel)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn model_download_cancel(state: State<'_, AppState>) {
+    state.model_cancel.store(true, Ordering::SeqCst);
+}
+
+/// Save the chosen model and load it in the background (no app restart).
+#[tauri::command]
+fn model_activate(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    if state.audio_running.load(Ordering::Relaxed) {
+        return Err("End the session before switching models.".into());
+    }
+    let root = models_root(&app).ok_or("no app data dir")?;
+    let path = models::model_file(&root, &id).ok_or_else(|| format!("unknown model: {id}"))?;
+    if !path.is_file() {
+        let label = models::spec(&id).map(|s| s.label).unwrap_or(id.as_str());
+        return Err(format!("{label} is not downloaded yet."));
+    }
+    {
+        let conn = state.db.lock().map_err(|_| "db lock poisoned")?;
+        db::set_setting(&conn, "stt_model", &id).map_err(|e| e.to_string())?;
+    }
+    let app = app.clone();
+    std::thread::Builder::new()
+        .name("model-load".into())
+        .spawn(move || {
+            let st = app.state::<AppState>();
+            let _ = app.emit(
+                "model://state",
+                serde_json::json!({ "status": "loading", "id": id.as_str() }),
+            );
+            tracing::info!("loading model {id} at {}", path.display());
+            match asr::Transcriber::new(&path, "auto", stt_threads()) {
+                Ok(t) => {
+                    st.set_transcriber(Arc::new(t));
+                    let _ = app.emit(
+                        "model://state",
+                        serde_json::json!({ "status": "ready", "id": id.as_str() }),
+                    );
+                }
+                Err(err) => {
+                    let message = format!("STT model: {err:#}");
+                    st.set_transcriber_error(message.clone());
+                    let _ = app.emit(
+                        "model://state",
+                        serde_json::json!({ "status": "error", "id": id.as_str(), "message": message }),
+                    );
+                }
+            }
+        })
+        .map_err(|e| format!("spawn model loader: {e}"))?;
+    Ok(())
+}
+
+/// Onboarding mic meter: emits `mic://level {level: 0..1}` every ~200 ms while
+/// the default microphone captures. A bumped generation stops the monitor.
+#[tauri::command]
+fn mic_check_start(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let generation = state.mic_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let stop = state.mic_gen.clone();
+    std::thread::Builder::new()
+        .name("mic-check".into())
+        .spawn(move || {
+            let (tx, rx) = std::sync::mpsc::channel::<audio::AudioChunk>();
+            let _ = app.emit("mic://state", serde_json::json!({ "running": true }));
+            let stream = match audio::start_mic(tx) {
+                Ok(s) => s,
+                Err(err) => {
+                    let _ = app.emit(
+                        "mic://level",
+                        serde_json::json!({ "error": format!("microphone: {err:#}") }),
+                    );
+                    return;
+                }
+            };
+            let mut buf: Vec<i16> = Vec::new();
+            while stop.load(Ordering::SeqCst) == generation {
+                match rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(chunk) => {
+                        buf.extend_from_slice(&chunk.samples);
+                        if buf.len() >= 1600 {
+                            let _ = app.emit(
+                                "mic://level",
+                                serde_json::json!({ "level": audio::level(&buf) }),
+                            );
+                            buf.clear();
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            drop(stream);
+            let _ = app.emit("mic://state", serde_json::json!({ "running": false }));
+        })
+        .map_err(|e| format!("spawn mic check: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn mic_check_stop(state: State<'_, AppState>) {
+    state.mic_gen.fetch_add(1, Ordering::SeqCst);
+}
+
 fn on_shortcut(app: &AppHandle, shortcut: &Shortcut, event: ShortcutEvent) {
     if event.state() != ShortcutState::Pressed {
         return;
@@ -571,7 +777,15 @@ pub fn run() {
             assist_ask,
             assist_cancel,
             api_key_status,
-            set_api_key
+            set_api_key,
+            onboarding_status,
+            onboarding_complete,
+            model_catalog,
+            model_download,
+            model_download_cancel,
+            model_activate,
+            mic_check_start,
+            mic_check_stop
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

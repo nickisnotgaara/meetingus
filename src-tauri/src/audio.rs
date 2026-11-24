@@ -29,6 +29,21 @@ pub struct AudioChunk {
     pub samples: Vec<i16>,
 }
 
+/// RMS of 16 kHz mono samples as 0..1, for the onboarding mic meter.
+pub fn level(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = samples
+        .iter()
+        .map(|&s| {
+            let v = s as f64 / 32768.0;
+            v * v
+        })
+        .sum();
+    ((sum / samples.len() as f64).sqrt() as f32).clamp(0.0, 1.0)
+}
+
 trait ToI16 {
     fn to_i16_sample(self) -> i16;
 }
@@ -239,5 +254,15 @@ mod tests {
         assert_eq!(0u16.to_i16_sample(), -32768);
         assert_eq!(65535u16.to_i16_sample(), 32767);
         assert_eq!(42i16.to_i16_sample(), 42);
+    }
+
+    #[test]
+    fn level_is_zero_for_silence_and_one_for_full_scale() {
+        assert_eq!(level(&[]), 0.0);
+        assert_eq!(level(&[0; 1600]), 0.0);
+        let full = vec![i16::MAX; 1600];
+        assert!((level(&full) - 1.0).abs() < 0.001, "full scale ~= 1");
+        let half = vec![i16::MAX / 2; 1600];
+        assert!((level(&half) - 0.5).abs() < 0.01, "half scale ~= 0.5");
     }
 }

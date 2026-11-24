@@ -89,6 +89,24 @@ pub fn latest_session_id(conn: &Connection) -> Result<Option<String>> {
         .optional()?)
 }
 
+/// Read an app setting. The API key never lives here (D6: OS keyring).
+pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM settings WHERE key=?1", [key], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
 /// Last `limit` transcript segments of a session, oldest first (context for Assist).
 pub fn recent_segments(
     conn: &Connection,
@@ -212,6 +230,18 @@ mod tests {
         assert_eq!(n, 2);
         // invalid role rejected by CHECK constraint
         assert!(insert_segment(&conn, &id, "bot", "x", 0, 1, None).is_err());
+    }
+
+    #[test]
+    fn settings_roundtrip_and_overwrite() {
+        let conn = mem();
+        assert_eq!(get_setting(&conn, "stt_model").unwrap(), None);
+        set_setting(&conn, "stt_model", "base").unwrap();
+        set_setting(&conn, "stt_model", "small").unwrap();
+        assert_eq!(
+            get_setting(&conn, "stt_model").unwrap().as_deref(),
+            Some("small")
+        );
     }
 
     #[test]
